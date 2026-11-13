@@ -1,0 +1,18 @@
+{
+  "data": {
+    "$type": "com.linkedin.restli.common.CollectionResponse",
+    "*elements": ["urn:li:fs_normalized_company:18645720"]
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.common.FollowingInfo",
+      "entityUrn": "urn:li:fs_followingInfo:urn:li:company:18645720"
+    },
+    {
+      "$type": "com.linkedin.voyager.organization.Company",
+      "entityUrn": "urn:li:fs_normalized_company:18645720",
+      "universalName": "supportiv",
+      "name": "Supportiv"
+    }
+  ]
+}

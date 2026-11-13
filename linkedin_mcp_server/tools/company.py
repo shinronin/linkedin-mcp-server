@@ -58,12 +58,13 @@ def register_company_tools(
             The LLM should parse the raw text in each section.
 
             When the about section is included, references["about"] may
-            include a {kind: "company_urn", value: "<numeric-id>"} entry —
-            present whenever the page exposes the "See all employees" link
-            (typically all but the smallest companies). The value is the
-            numeric id LinkedIn's people-search uses in its currentCompany
-            URL facet; plain-text company names are silently ignored by
-            that facet.
+            include a {kind: "company_urn", value: "<numeric-id>"} entry.
+            The about page supplies it from the "See all employees" link.
+            If that link is missing, or the about page is a Cloudflare
+            check reported under section_errors, the tool looks the slug
+            up once and still returns the id. The value is the numeric id
+            LinkedIn's people-search uses in its currentCompany URL facet;
+            plain-text company names are silently ignored by that facet.
         """
         try:
             extractor = extractor or await get_ready_extractor(

@@ -1,5 +1,6 @@
 """Tests for the LinkedInExtractor scraping engine."""
 
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -1743,6 +1744,159 @@ class TestScrapeCompany:
             "/search/results/people/?currentCompany=%5B%221115%22%5D"
         )
         assert "text" not in urns[0]
+
+    async def test_cloudflare_interstitial_skips_the_main_wait(self, mock_page):
+        mock_page.evaluate = AsyncMock(return_value=True)
+        extractor = LinkedInExtractor(mock_page)
+
+        result = await extractor.extract_page(
+            "https://www.linkedin.com/company/supportiv/about/",
+            section_name="about",
+        )
+
+        assert result.text == ""
+        assert result.error == {
+            "error_type": "cloudflare",
+            "error_message": (
+                "[Cloudflare] LinkedIn served a security check instead of this section."
+            ),
+        }
+        mock_page.wait_for_selector.assert_not_awaited()
+
+    async def test_late_cloudflare_splash_is_a_section_error(self, mock_page):
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "body",
+                "text": "security check",
+                "references": [
+                    {
+                        "href": "https://www.cloudflare.com/5xx-error-landing",
+                        "text": "",
+                    }
+                ],
+            }
+        )
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_is_cloudflare_interstitial",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            result = await extractor.extract_page(
+                "https://www.linkedin.com/company/life360/about/",
+                section_name="about",
+            )
+
+        assert result.text == ""
+        assert result.error is not None
+        assert result.error["error_type"] == "cloudflare"
+
+    async def test_scrape_company_adds_urn_when_about_is_cloudflare(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=ExtractedSection(
+                    text="",
+                    references=[],
+                    error={
+                        "error_type": "cloudflare",
+                        "error_message": "blocked",
+                    },
+                ),
+            ),
+            patch.object(
+                extractor,
+                "_lookup_company_id",
+                new_callable=AsyncMock,
+                return_value="18645720",
+            ) as lookup,
+        ):
+            result = await extractor.scrape_company("supportiv", {"about"})
+
+        lookup.assert_awaited_once_with("supportiv")
+        assert "about" not in result["sections"]
+        assert result["section_errors"]["about"]["error_type"] == "cloudflare"
+        assert result["references"]["about"] == [
+            {
+                "kind": "company_urn",
+                "value": "18645720",
+                "url": ("/search/results/people/?currentCompany=%5B%2218645720%22%5D"),
+            }
+        ]
+
+    async def test_scrape_company_skips_lookup_when_about_has_urn(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=extracted(
+                    "About SAP",
+                    [
+                        {
+                            "kind": "company_urn",
+                            "value": "1115",
+                            "url": (
+                                "/search/results/people/"
+                                "?currentCompany=%5B%221115%22%5D"
+                            ),
+                        }
+                    ],
+                ),
+            ),
+            patch.object(
+                extractor,
+                "_lookup_company_id",
+                new_callable=AsyncMock,
+            ) as lookup,
+        ):
+            result = await extractor.scrape_company("sap", {"about"})
+
+        lookup.assert_not_awaited()
+        assert result["references"]["about"][0]["value"] == "1115"
+
+    async def test_lookup_company_id_uses_jsessionid_and_matching_slug(self, mock_page):
+        fixture = Path(__file__).parent / "fixtures" / "voyager_company_supportiv.json"
+        mock_page.context.cookies = AsyncMock(
+            return_value=[{"name": "JSESSIONID", "value": '"ajax:token"'}]
+        )
+        mock_page.evaluate = AsyncMock(
+            return_value={"status": 200, "body": fixture.read_text()}
+        )
+        extractor = LinkedInExtractor(mock_page)
+
+        assert await extractor._lookup_company_id("supportiv") == "18645720"
+        call = mock_page.evaluate.await_args
+        assert call is not None
+        url = call.args[1]["url"]
+        csrf = call.args[1]["csrf"]
+        assert "universalName=supportiv" in url
+        assert csrf == "ajax:token"
 
 
 class TestScrapeJob:

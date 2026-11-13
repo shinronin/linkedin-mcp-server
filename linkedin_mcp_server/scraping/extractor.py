@@ -37,6 +37,13 @@ from linkedin_mcp_server.scraping.link_metadata import (
     dedupe_references,
 )
 
+from .company_urn import (
+    cloudflare_interstitial,
+    cloudflare_section_error,
+    company_lookup_url,
+    company_urn_reference,
+    extract_company_id_for_slug,
+)
 from .fields import COMPANY_SECTIONS, PERSON_SECTIONS
 
 if TYPE_CHECKING:
@@ -54,6 +61,45 @@ _RATE_LIMIT_RETRY_DELAY = 5.0
 
 # Returned as section text when LinkedIn rate-limits the page
 _RATE_LIMITED_MSG = "[Rate limited] LinkedIn blocked this section. Try again later or request fewer sections."
+
+# No <main>, plus an anchor whose href contains cloudflare.com. The
+# interstitial copy is locale-dependent, so it is not part of the check.
+_CLOUDFLARE_INTERSTITIAL_JS = """
+() => {
+    if (document.querySelector("main")) {
+        return false;
+    }
+    const anchors = document.querySelectorAll("a[href]");
+    for (const anchor of anchors) {
+        const href = anchor.href || anchor.getAttribute("href") || "";
+        if (href.includes("cloudflare.com")) {
+            return true;
+        }
+    }
+    return false;
+}
+"""
+
+# In-page fetch so the organization lookup rides the logged-in session.
+# csrf-token is the JSESSIONID cookie value, passed in by the caller.
+_COMPANY_LOOKUP_JS = """
+async ({ url, csrf }) => {
+    try {
+        const response = await fetch(url, {
+            credentials: "include",
+            headers: {
+                "csrf-token": csrf,
+                "x-restli-protocol-version": "2.0.0",
+                "accept": "application/vnd.linkedin.normalized+json+2.1",
+            },
+        });
+        const body = await response.text();
+        return { status: response.status, body: body.slice(0, 200000) };
+    } catch (error) {
+        return { status: 0, body: "" };
+    }
+}
+"""
 
 # LinkedIn shows 25 results per page
 _PAGE_SIZE = 25
@@ -1143,6 +1189,14 @@ class LinkedInExtractor:
         scrolling, innerText extraction, noise truncation, and reference
         building — everything ``_extract_page_once`` does after the goto.
         """
+        if await self._is_cloudflare_interstitial():
+            logger.info("Cloudflare interstitial on %s", url)
+            return ExtractedSection(
+                text="",
+                references=[],
+                error=cloudflare_section_error(),
+            )
+
         await detect_rate_limit(self._page)
 
         # Wait for main content to render
@@ -1262,6 +1316,13 @@ class LinkedInExtractor:
 
         # Extract text from main content area
         raw_result = await self._extract_root_content(["main"])
+        if self._root_is_cloudflare_interstitial(raw_result):
+            logger.info("Cloudflare interstitial on %s", url)
+            return ExtractedSection(
+                text="",
+                references=[],
+                error=cloudflare_section_error(),
+            )
         raw = raw_result["text"]
 
         if not raw:
@@ -1277,6 +1338,90 @@ class LinkedInExtractor:
             text=cleaned,
             references=build_references(raw_result["references"], section_name),
         )
+
+    async def _is_cloudflare_interstitial(self) -> bool:
+        """True when the current document is a Cloudflare check, not a LinkedIn page."""
+        try:
+            result = await self._page.evaluate(_CLOUDFLARE_INTERSTITIAL_JS)
+        except Exception:
+            logger.debug("Cloudflare interstitial check failed", exc_info=True)
+            return False
+        return result is True
+
+    @staticmethod
+    def _root_is_cloudflare_interstitial(raw_result: Any) -> bool:
+        """Same check from extracted root content, for a splash that appears late."""
+        if not isinstance(raw_result, dict):
+            return False
+        references = raw_result.get("references") or []
+        hrefs = [
+            ref["href"]
+            for ref in references
+            if isinstance(ref, dict) and isinstance(ref.get("href"), str)
+        ]
+        return cloudflare_interstitial(
+            has_main=raw_result.get("source") == "root",
+            hrefs=hrefs,
+        )
+
+    async def _attach_company_urn(
+        self,
+        company_name: str,
+        references: dict[str, list[Reference]],
+    ) -> None:
+        """Fill ``references["about"]`` when the about page had no company id."""
+        about_refs = references.get("about") or []
+        if any(ref.get("kind") == "company_urn" for ref in about_refs):
+            return
+        company_id = await self._lookup_company_id(company_name)
+        if not company_id:
+            return
+        references.setdefault("about", []).append(company_urn_reference(company_id))
+
+    async def _lookup_company_id(self, company_name: str) -> str | None:
+        """Look up a company slug via the logged-in organization endpoint.
+
+        One request. A non-JSON body, a non-200 status, or a payload whose
+        ``universalName`` is not this slug returns None. Callers record the
+        miss and do not retry.
+        """
+        slug = company_name.strip()
+        if not slug:
+            return None
+        try:
+            cookies = await self._page.context.cookies("https://www.linkedin.com")
+        except Exception:
+            logger.debug("Company id lookup could not read cookies", exc_info=True)
+            return None
+        if not isinstance(cookies, list):
+            return None
+        csrf = ""
+        for cookie in cookies:
+            if isinstance(cookie, dict) and cookie.get("name") == "JSESSIONID":
+                csrf = str(cookie.get("value") or "").strip().strip('"')
+                break
+        if not csrf:
+            logger.info("Company id lookup skipped for %s: no JSESSIONID", slug)
+            return None
+        try:
+            result = await self._page.evaluate(
+                _COMPANY_LOOKUP_JS,
+                {"url": company_lookup_url(slug), "csrf": csrf},
+            )
+        except Exception:
+            logger.warning("Company id lookup failed for %s", slug, exc_info=True)
+            return None
+        if not isinstance(result, dict) or result.get("status") != 200:
+            status = result.get("status") if isinstance(result, dict) else "invalid"
+            logger.info("Company id lookup for %s returned status %s", slug, status)
+            return None
+        body = result.get("body") or ""
+        if not isinstance(body, str):
+            return None
+        company_id = extract_company_id_for_slug(body, slug)
+        if not company_id:
+            logger.info("Company id lookup for %s did not match universalName", slug)
+        return company_id
 
     async def _extract_overlay(
         self,
@@ -2432,6 +2577,8 @@ class LinkedInExtractor:
             if callbacks:
                 await callbacks.on_error(e)
             raise
+
+        await self._attach_company_urn(company_name, references)
 
         result: dict[str, Any] = {
             "url": f"{base_url}/",
